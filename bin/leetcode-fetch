@@ -1,0 +1,879 @@
+#!/usr/bin/env python3
+"""Fetch a LeetCode problem and scaffold its folder as CLAUDE.md describes.
+
+    leetcode-fetch 4
+    leetcode-fetch median-of-two-sorted-arrays
+    leetcode-fetch https://leetcode.com/problems/two-sum/
+    leetcode-fetch lists                    # your LeetCode lists
+    leetcode-fetch lists "Refreshing C++"   # ... and what is in one
+
+Creates <id>-<title-slug>/ with cpp/ (implementation, driver, CMakeLists.txt)
+and python/solution.py, each carrying the problem description as a comment.
+
+Data comes from LeetCode's public GraphQL endpoint; no account or key needed.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+GRAPHQL = "https://leetcode.com/graphql"
+PROBLEM_LIST = "https://leetcode.com/api/problems/all/"
+CACHE = os.path.expanduser("~/.cache/leetcode-fetch/problems.json")
+SESSION_FILE = os.path.expanduser("~/.config/leetcode-fetch/session")
+CACHE_TTL = 7 * 24 * 3600
+UA = "Mozilla/5.0 (X11; Linux x86_64) leetcode-fetch"
+
+LISTS_QUERY = """
+query myFavoriteList {
+  userStatus { isSignedIn }
+  myCreatedFavoriteList {
+    favorites { slug name favoriteType questionNumber isPublicFavorite }
+  }
+}
+"""
+
+LIST_QUESTIONS_QUERY = """
+query favoriteQuestionList($favoriteSlug: String!, $limit: Int, $skip: Int) {
+  favoriteQuestionList(favoriteSlug: $favoriteSlug, limit: $limit, skip: $skip) {
+    questions { questionFrontendId title titleSlug difficulty status paidOnly }
+    totalLength
+    hasMore
+  }
+}
+"""
+
+QUESTION_QUERY = """
+query question($titleSlug: String!) {
+  question(titleSlug: $titleSlug) {
+    questionFrontendId
+    title
+    titleSlug
+    difficulty
+    content
+    exampleTestcases
+    metaData
+    codeSnippets { langSlug code }
+  }
+}
+"""
+
+
+def die(msg):
+    sys.exit("leetcode-fetch: " + msg)
+
+
+# --------------------------------------------------------------------------- http
+
+
+def load_session():
+    """Read the LeetCode session cookie, from the environment or ~/.config."""
+    cookies = {}
+    if os.environ.get("LEETCODE_SESSION"):
+        cookies["LEETCODE_SESSION"] = os.environ["LEETCODE_SESSION"].strip()
+    elif os.path.exists(SESSION_FILE):
+        for line in open(SESSION_FILE):
+            key, _, value = line.strip().partition("=")
+            if value:
+                cookies[key.strip()] = value.strip()
+    if "LEETCODE_SESSION" not in cookies:
+        die("no session cookie; put LEETCODE_SESSION=... in %s (chmod 600)\n"
+            "  Copy it from your browser: DevTools -> Application -> Cookies -> leetcode.com"
+            % SESSION_FILE)
+    return cookies
+
+
+def get(url, data=None, cookies=None):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://leetcode.com"})
+    if cookies:
+        req.add_header("Cookie", "; ".join("%s=%s" % item for item in cookies.items()))
+        if "csrftoken" in cookies:
+            req.add_header("x-csrftoken", cookies["csrftoken"])
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+        req.data = json.dumps(data).encode()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        die("%s returned HTTP %d" % (url, exc.code))
+    except urllib.error.URLError as exc:
+        die("cannot reach %s (%s)" % (url, exc.reason))
+
+
+def slug_for_number(number):
+    """Resolve a problem number to its title slug, via a cached problem list."""
+    data = None
+    if os.path.exists(CACHE) and time.time() - os.path.getmtime(CACHE) < CACHE_TTL:
+        with open(CACHE) as handle:
+            data = json.load(handle)
+    if data is None:
+        data = get(PROBLEM_LIST)
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w") as handle:
+            json.dump(data, handle)
+    for pair in data["stat_status_pairs"]:
+        if pair["stat"]["frontend_question_id"] == number:
+            if pair["paid_only"]:
+                die("problem %d is premium-only; its content is not public" % number)
+            return pair["stat"]["question__title_slug"]
+    die("no problem numbered %d" % number)
+
+
+def resolve_slug(target):
+    match = re.search(r"leetcode\.com/problems/([\w-]+)", target)
+    if match:
+        return match.group(1)
+    if target.isdigit():
+        return slug_for_number(int(target))
+    return target.strip().strip("/")
+
+
+# ------------------------------------------------------------------- description
+
+
+def html_to_text(html):
+    """Render the problem statement as plain text; pandoc if present, else crudely."""
+    if shutil.which("pandoc"):
+        proc = subprocess.run(
+            ["pandoc", "-f", "html", "-t", "plain", "--wrap=none"],
+            input=html, capture_output=True, text=True,
+        )
+        if proc.returncode == 0:
+            text = proc.stdout
+        else:
+            text = None
+    else:
+        text = None
+    if text is None:
+        text = re.sub(r"<[^>]+>", "", html)
+        text = (text.replace("&nbsp;", " ").replace("&lt;", "<").replace("&gt;", ">")
+                    .replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'"))
+    lines = [line.rstrip() for line in text.splitlines()]
+    lines = [("" if not line.strip() else line) for line in lines]
+    out = []
+    for line in lines:
+        if not line and out and not out[-1]:
+            continue
+        out.append(line)
+    while out and not out[0]:
+        out.pop(0)
+    while out and not out[-1]:
+        out.pop()
+    return out
+
+
+def comment_block(question, text_lines, prefix):
+    header = "%s. %s" % (question["questionFrontendId"], question["title"])
+    pad = max(1, 70 - len(header) - len(prefix))
+    out = ["%s%s%s[%s]" % (prefix, header, " " * pad, question["difficulty"]),
+           prefix.rstrip(), ""]
+    out[1] = prefix.rstrip()
+    body = ["%s%s" % (prefix, line) if line else prefix.rstrip() for line in text_lines]
+    out = out[:2] + body
+    out.append(prefix.rstrip() + " https://leetcode.com/problems/%s/" % question["titleSlug"])
+    return "\n".join(line.rstrip() for line in out)
+
+
+# ------------------------------------------------------------------- c++ snippet
+
+
+HEADERS = {
+    "vector": "vector", "string": "string", "unordered_map": "unordered_map",
+    "unordered_set": "unordered_set", "map": "map", "set": "set", "pair": "utility",
+    "queue": "queue", "priority_queue": "queue", "stack": "stack", "deque": "deque",
+    "list": "list", "array": "array", "optional": "optional", "function": "functional",
+    "tuple": "tuple",
+}
+
+
+def strip_comments(code):
+    code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
+    return re.sub(r"//[^\n]*", "", code)
+
+
+def needed_headers(code):
+    code = strip_comments(code)
+    found = set()
+    for name, header in HEADERS.items():
+        if re.search(r"\b%s\b" % name, code):
+            found.add(header)
+    return sorted(found)
+
+
+def split_top_level(text, sep=","):
+    """Split on `sep` outside brackets, angle brackets and quotes."""
+    parts, depth, quote, current = [], 0, None, []
+    for char in text:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in "([{<":
+            depth += 1
+        elif char in ")]}>":
+            depth -= 1
+        if char == sep and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if "".join(current).strip():
+        parts.append("".join(current))
+    return [part.strip() for part in parts]
+
+
+def placeholder_return(ret):
+    ret = ret.strip()
+    if not ret or ret == "void":
+        return None
+    if ret.endswith("*"):
+        return "return nullptr;"
+    if ret == "bool":
+        return "return false;"
+    if ret in ("double", "float"):
+        return "return 0.0;"
+    if ret in ("int", "long", "long long", "char", "unsigned", "size_t"):
+        return "return 0;"
+    return "return {};"
+
+
+def commented_types(preamble):
+    """LeetCode shows ListNode/TreeNode only as a comment; locally they must be real."""
+    lines = [re.sub(r"^\s*\*\s?", "", line) for line in preamble.splitlines()]
+    lines = [line for line in lines if not line.strip().startswith(("/*", "*/"))]
+    text = "\n".join(lines)
+    blocks = []
+    for match in re.finditer(r"\b(?:struct|class)\s+\w+\s*\{", text):
+        depth, index = 0, match.start()
+        while index < len(text):
+            if text[index] == "{":
+                depth += 1
+            elif text[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = text.find(";", index)
+                    blocks.append(text[match.start():end + 1 if end != -1 else index + 1])
+                    break
+            index += 1
+    return blocks
+
+
+TYPES_HEADER = "leetcode_types.h"
+TYPES_INCLUDE = "\n".join([
+    '#if __has_include("%s")' % TYPES_HEADER,
+    '#include "%s"  // local only; LeetCode predefines these types' % TYPES_HEADER,
+    "#endif",
+])
+
+
+def render_types(blocks):
+    return "\n".join([
+        "// Types LeetCode predefines on its judge and only shows you as a comment.",
+        "// Local builds need them for real; the guarded include in the solution",
+        "// files makes this header invisible when the code is pasted back.",
+        "#pragma once",
+        "",
+    ] + [block + "\n" for block in blocks])
+
+
+def parse_cpp(snippet):
+    """Find the class in LeetCode's snippet and fill its empty method bodies."""
+    lines = snippet.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        match = re.match(r"\s*class\s+(\w+)\s*\{", line)
+        if match:
+            start, class_name = index, match.group(1)
+            break
+    if start is None:
+        die("could not find a class in the C++ snippet")
+
+    depth, end = 0, None
+    for index in range(start, len(lines)):
+        depth += lines[index].count("{") - lines[index].count("}")
+        if depth == 0 and index > start:
+            end = index
+            break
+    if end is None:
+        die("unbalanced braces in the C++ snippet")
+
+    body = lines[start + 1:end]
+    class_lines, methods, index, depth = [lines[start]], [], 0, 0
+    while index < len(body):
+        line = body[index]
+        stripped = line.strip()
+        is_signature = (depth == 0 and "(" in stripped and not stripped.startswith("//")
+                        and not stripped.endswith(";"))
+        if is_signature:
+            signature_lines = [line]
+            while not signature_lines[-1].rstrip().endswith("{") and index + 1 < len(body):
+                index += 1
+                signature_lines.append(body[index])
+            signature = " ".join(part.strip() for part in signature_lines)
+            if not signature.endswith("{"):
+                class_lines += signature_lines
+                index += 1
+                continue
+            signature = signature[:-1].strip()
+            indent = line[:len(line) - len(line.lstrip())]
+            inner, inner_depth, index = [], 1, index + 1
+            closing = indent + "}"
+            while index < len(body):
+                inner_depth += body[index].count("{") - body[index].count("}")
+                if inner_depth == 0:
+                    closing = body[index]
+                    index += 1
+                    break
+                inner.append(body[index])
+                index += 1
+            inner = [line for line in inner if line.strip()]
+            if not inner:
+                head = signature[:signature.index("(")]
+                ret = head[:re.search(r"([~\w]+)\s*$", head).start(1)].strip()
+                inner = [indent + "    // TODO"]
+                ret_stmt = placeholder_return(ret)
+                if ret_stmt:
+                    inner.append(indent + "    " + ret_stmt)
+            class_lines += signature_lines + inner + [closing]
+            methods.append((signature, inner))
+            continue
+        depth += line.count("{") - line.count("}")
+        class_lines.append(line)
+        index += 1
+    class_lines.append(lines[end])
+
+    preamble = "\n".join(lines[:start]).strip()
+    return {
+        "class_name": class_name,
+        "preamble": preamble,
+        "types": commented_types(preamble),
+        "class_block": "\n".join(line.rstrip() for line in class_lines),
+        "methods": methods,
+    }
+
+
+# ---------------------------------------------------------------------- examples
+
+
+def parse_examples(text_lines):
+    examples, current, expect_output = [], None, False
+    for line in text_lines:
+        stripped = line.strip()
+        if expect_output:
+            expect_output = False
+            if stripped and current is not None and current["output"] is None:
+                current["output"] = stripped
+                current["input"] = current["input"] or "(see testcases)"
+                continue
+        if re.match(r"^Example\s+\d+:", stripped):
+            if current:
+                examples.append(current)
+            current = {"input": None, "output": None}
+        elif stripped == "Output":
+            expect_output = True
+        elif current is not None:
+            if stripped.startswith("Input:") and current["input"] is None:
+                current["input"] = stripped[len("Input:"):].strip()
+            elif stripped.startswith("Output:") and current["output"] is None:
+                current["output"] = stripped[len("Output:"):].strip()
+            elif stripped.startswith("Constraints"):
+                break
+    if current:
+        examples.append(current)
+    return [ex for ex in examples if ex["input"] and ex["output"]]
+
+
+def parse_assignments(text):
+    """`nums1 = [1,3], nums2 = [2]` -> [('nums1', '[1,3]'), ('nums2', '[2]')]."""
+    out = []
+    for chunk in split_top_level(text):
+        if "=" not in chunk:
+            return []
+        name, _, value = chunk.partition("=")
+        if not re.match(r"^\w+$", name.strip()):
+            return []
+        out.append((name.strip(), value.strip()))
+    return out
+
+
+def to_cpp_literal(value):
+    out, quote = [], None
+    for char in value:
+        if quote:
+            out.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            out.append(char)
+        elif char == "[":
+            out.append("{")
+        elif char == "]":
+            out.append("}")
+        else:
+            out.append(char)
+    literal = "".join(out)
+    return re.sub(r"\bnull\b", "nullptr", literal)
+
+
+def to_py_literal(value):
+    literal = re.sub(r"\btrue\b", "True", value)
+    literal = re.sub(r"\bfalse\b", "False", literal)
+    return re.sub(r"\bnull\b", "None", literal)
+
+
+def testcase_values(question, count):
+    """exampleTestcases is one line per parameter, cases back to back."""
+    raw = (question.get("exampleTestcases") or "").strip()
+    if not raw or count <= 0:
+        return []
+    lines = [line for line in raw.splitlines() if line.strip()]
+    if len(lines) % count:
+        return []
+    return [lines[i:i + count] for i in range(0, len(lines), count)]
+
+
+def expected_outputs(examples, wanted):
+    outputs = [example["output"] for example in examples]
+    return outputs if len(outputs) == wanted else [None] * wanted
+
+
+def design_cases(question, meta):
+    """Design problems ship a call script: ["LRUCache","put",...] + [[2],[1,1],...]."""
+    if not (meta.get("classname") and meta.get("methods")):
+        return []
+    raw = (question.get("exampleTestcases") or "").strip()
+    lines = [line for line in raw.splitlines() if line.strip()]
+    if not lines or len(lines) % 2:
+        return []
+    cases = []
+    for index in range(0, len(lines), 2):
+        try:
+            operations, arguments = json.loads(lines[index]), json.loads(lines[index + 1])
+        except json.JSONDecodeError:
+            return []
+        if len(operations) != len(arguments):
+            return []
+        cases.append(list(zip(operations, arguments)))
+    return cases
+
+
+def meta_data(question):
+    try:
+        return json.loads(question.get("metaData") or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def parse_params(signature):
+    paren = signature.index("(")
+    inside = signature[paren + 1:signature.rindex(")")]
+    if not inside.strip():
+        return []
+    params = []
+    for chunk in split_top_level(inside):
+        match = re.search(r"(\w+)\s*$", chunk)
+        if not match:
+            return None
+        name = match.group(1)
+        type_name = chunk[:match.start(1)].strip().rstrip("&").strip()
+        params.append((type_name, name))
+    return params
+
+
+# --------------------------------------------------------------------- rendering
+
+
+def render_impl(question, description, parsed, headers):
+    parts = [comment_block(question, description, "// "), ""]
+    includes = ["#include <%s>" % header for header in headers]
+    if includes:
+        parts.append("\n".join(includes))
+        parts.append("using namespace std;")
+        parts.append("")
+    if parsed["preamble"]:
+        parts.append(parsed["preamble"])
+        parts.append("")
+    if parsed["types"]:
+        parts.append(TYPES_INCLUDE)
+        parts.append("")
+    parts.append(parsed["class_block"])
+    return "\n".join(parts) + "\n"
+
+
+def render_driver(question, parsed, headers, examples, impl_name):
+    method = parsed["methods"][0] if len(parsed["methods"]) == 1 else None
+    params = parse_params(method[0]) if method else None
+    ret = ""
+    if method:
+        paren = method[0].index("(")
+        head = method[0][:paren]
+        ret = head[:re.search(r"([~\w]+)\s*$", head).start(1)].strip()
+
+    usable = []
+    if method and params is not None and "*" not in "".join(t for t, _ in params):
+        cases = testcase_values(question, len(params))
+        if cases:
+            for case, expected in zip(cases, expected_outputs(examples, len(cases))):
+                usable.append((expected, list(zip([name for _, name in params], case))))
+        else:
+            for example in examples:
+                assignments = parse_assignments(example["input"])
+                names = [name for name, _ in assignments]
+                if assignments and names == [name for _, name in params]:
+                    usable.append((example["output"], assignments))
+
+    includes = sorted(set(headers) | {"iostream", "vector"})
+    if ret in ("double", "float"):
+        includes = sorted(set(includes) | {"iomanip"})
+
+    parts = [
+        "// Local driver for \"%s. %s\"." % (question["questionFrontendId"], question["title"]),
+        "// Not part of the LeetCode submission.",
+        "",
+        "\n".join("#include <%s>" % header for header in includes),
+        "using namespace std;",
+        "",
+    ]
+    parts += ['#include "%s"  // class %s, exactly as pasted into LeetCode'
+              % (impl_name, parsed["class_name"]), ""]
+
+    printer = True
+    if printer:
+        parts += [
+            "namespace {",
+            "",
+            "template <typename T> void print(const T& value);",
+            "template <typename T> void print(const vector<T>& values);",
+            "",
+            "template <typename T> void print(const T& value) { cout << value; }",
+            "",
+            "template <typename T> void print(const vector<T>& values) {",
+            "    cout << '[';",
+            "    for (size_t i = 0; i < values.size(); ++i) {",
+            "        if (i) cout << ',';",
+            "        print(values[i]);",
+            "    }",
+            "    cout << ']';",
+            "}",
+            "",
+            "}  // namespace",
+            "",
+        ]
+
+    main = ["int main() {"]
+    setup = ["cout << boolalpha"]
+    if ret in ("double", "float"):
+        setup.append(" << fixed << setprecision(5)")
+    main.append("    " + "".join(setup) + ";")
+    main.append("")
+
+    design = design_cases(question, meta_data(question))
+    if design:
+        returns = {m["name"]: m["return"]["type"] for m in meta_data(question)["methods"]}
+        expectations = expected_outputs(examples, len(design))
+        for number, (script, expected) in enumerate(zip(design, expectations), 1):
+            main.append("    {  // Example %d" % number)
+            (_, constructor_args), calls = script[0], script[1:]
+            args = ", ".join(to_cpp_literal(json.dumps(a)) for a in constructor_args)
+            main.append("        %s obj%s;" % (parsed["class_name"], "(%s)" % args if args else ""))
+            main.append("        cout << \"[null\";")
+            for name, arguments in calls:
+                call = "obj.%s(%s)" % (name, ", ".join(to_cpp_literal(json.dumps(a))
+                                                       for a in arguments))
+                if returns.get(name, "void") == "void":
+                    main.append("        %s;" % call)
+                    main.append("        cout << \",null\";")
+                else:
+                    main.append("        cout << ',';")
+                    main.append("        print(%s);" % call)
+            main.append("        cout << \"]\\n\";")
+            if expected is not None:
+                main.append("        cout << \"    expected: %s\\n\";" % expected)
+            main.append("    }")
+            main.append("")
+    elif usable:
+        for number, (expected, assignments) in enumerate(usable, 1):
+            main.append("    {  // Example %d" % number)
+            for (type_name, _), (name, value) in zip(params, assignments):
+                main.append("        %s %s = %s;" % (type_name, name, to_cpp_literal(value)))
+            main.append("        %s solution;" % parsed["class_name"])
+            call = "solution.%s(%s)" % (
+                re.search(r"([~\w]+)\s*\(", method[0]).group(1),
+                ", ".join(name for _, name in params),
+            )
+            if printer:
+                main.append("        print(%s);" % call)
+                if expected is not None:
+                    main.append("        cout << \"    expected: %s\\n\";" % expected)
+                else:
+                    main.append("        cout << '\\n';")
+            else:
+                main.append("        %s;" % call)
+            main.append("    }")
+            main.append("")
+    else:
+        main.append("    // TODO: drive the class with the examples from the statement.")
+        for number, example in enumerate(examples, 1):
+            main.append("    // Example %d: Input: %s -> Output: %s"
+                        % (number, example["input"], example["output"]))
+        main.append("")
+    main.append("    return 0;")
+    main.append("}")
+    parts.append("\n".join(main))
+    return "\n".join(parts) + "\n"
+
+
+def render_cmake(target, impl_name):
+    return "\n".join([
+        "cmake_minimum_required(VERSION 3.20)",
+        "project(%s LANGUAGES CXX)" % target,
+        "",
+        "set(CMAKE_CXX_STANDARD 20)",
+        "set(CMAKE_CXX_STANDARD_REQUIRED ON)",
+        "set(CMAKE_CXX_EXTENSIONS OFF)",
+        "",
+        "# %s is #included by solution.cpp; it is listed only so the IDE indexes it." % impl_name,
+        "add_executable(%s" % target,
+        "    solution.cpp",
+        "    %s" % impl_name,
+        ")",
+        "set_source_files_properties(%s PROPERTIES HEADER_FILE_ONLY ON)" % impl_name,
+        "",
+    ])
+
+
+def render_python(question, description, snippet, examples):  # noqa: C901
+    body = []
+    lines = snippet.splitlines()
+    for index, line in enumerate(lines):
+        body.append(line)
+        if line.strip().startswith("def ") and line.rstrip().endswith(":"):
+            indent = len(line) - len(line.lstrip())
+            following = [l for l in lines[index + 1:] if l.strip()]
+            deeper = following and (len(following[0]) - len(following[0].lstrip())) > indent
+            if not deeper:
+                body.append(" " * (indent + 4) + "# TODO")
+                body.append(" " * (indent + 4) + "raise NotImplementedError")
+    snippet_text = "\n".join(line.rstrip() for line in body).rstrip()
+
+    typing_names = sorted({name for name in ("List", "Optional", "Dict", "Set", "Tuple")
+                           if re.search(r"\b%s\[" % name, snippet_text)})
+    method = re.search(r"def\s+(\w+)\s*\(self,?([^)]*)\)", snippet_text)
+
+    parts = [comment_block(question, description, "# "), ""]
+    if typing_names:
+        parts += ["from typing import %s" % ", ".join(typing_names), "", ""]
+    parts += [snippet_text, "", ""]
+
+    meta = meta_data(question)
+    design = design_cases(question, meta)
+    main = ['if __name__ == "__main__":']
+    emitted = False
+    if design:
+        expectations = expected_outputs(examples, len(design))
+        for number, (script, expected) in enumerate(zip(design, expectations), 1):
+            (name, constructor_args), calls = script[0], script[1:]
+            main.append("    # Example %d" % number)
+            main.append("    obj = %s(%s)"
+                        % (name, ", ".join(to_py_literal(json.dumps(a))
+                                           for a in constructor_args)))
+            main.append("    results = [None]")
+            for call_name, arguments in calls:
+                main.append("    results.append(obj.%s(%s))"
+                            % (call_name, ", ".join(to_py_literal(json.dumps(a))
+                                                    for a in arguments)))
+            comment = "  # expected: %s" % expected if expected else ""
+            main.append("    print(results)%s" % comment)
+            main.append("")
+            emitted = True
+    elif method:
+        main.append("    solution = Solution()")
+        names = [n.strip().split(":")[0].strip()
+                 for n in method.group(2).split(",") if n.strip()]
+        cases = testcase_values(question, len(names))
+        expectations = expected_outputs(examples, len(cases))
+        for number, (case, expected) in enumerate(zip(cases, expectations), 1):
+            args = ", ".join(to_py_literal(value) for value in case)
+            comment = "  # expected: %s" % expected if expected else ""
+            main.append("    # Example %d" % number)
+            main.append("    print(solution.%s(%s))%s" % (method.group(1), args, comment))
+            emitted = True
+    if not emitted:
+        main.append("    # TODO: drive the class with the examples from the statement.")
+    parts.append("\n".join(main))
+    return "\n".join(parts) + "\n"
+
+
+# ------------------------------------------------------------------------- lists
+
+
+STATUS = {"AC": "solved", "TRIED": "tried", "TO_DO": "-", None: "-"}
+
+
+def fetch_lists(cookies):
+    payload = get(GRAPHQL, {"query": LISTS_QUERY, "variables": {}}, cookies)
+    data = payload.get("data") or {}
+    if not (data.get("userStatus") or {}).get("isSignedIn"):
+        die("session cookie is not valid — LeetCode says you are signed out.\n"
+            "  Signing out in the browser revokes it, and so does a password change.\n"
+            "  Copy a fresh LEETCODE_SESSION into %s" % SESSION_FILE)
+    created = data.get("myCreatedFavoriteList")
+    if created is None:
+        die("could not read your lists")
+    return created["favorites"]
+
+
+def fetch_list_questions(cookies, slug):
+    questions, skip = [], 0
+    while True:
+        payload = get(GRAPHQL, {"query": LIST_QUESTIONS_QUERY,
+                                "variables": {"favoriteSlug": slug, "limit": 100, "skip": skip}},
+                      cookies)
+        data = (payload.get("data") or {}).get("favoriteQuestionList")
+        if not data:
+            die("could not read list '%s'" % slug)
+        questions += data["questions"]
+        if not data["hasMore"]:
+            return questions
+        skip += 100
+
+
+def pick_list(favorites, wanted):
+    exact = [f for f in favorites if wanted in (f["slug"], f["name"])]
+    if exact:
+        return exact[0]
+    loose = [f for f in favorites if wanted.lower() in f["name"].lower()]
+    if len(loose) == 1:
+        return loose[0]
+    if not loose:
+        die("no list matching '%s'; you have: %s"
+            % (wanted, ", ".join(f["name"] for f in favorites)))
+    die("'%s' matches several lists: %s" % (wanted, ", ".join(f["name"] for f in loose)))
+
+
+def show_questions(questions, indent=""):
+    for question in questions:
+        print("%s%5s  %-9s %-7s %s%s"
+              % (indent, question["questionFrontendId"], question["difficulty"].title(),
+                 STATUS.get(question["status"], "-"), question["title"],
+                 "  (premium)" if question["paidOnly"] else ""))
+
+
+def cmd_lists(argv):
+    parser = argparse.ArgumentParser(prog="leetcode-fetch lists",
+                                     description="Show your LeetCode lists and their problems.")
+    parser.add_argument("name", nargs="?", help="list name or slug; omit to show every list")
+    parser.add_argument("-C", "--root", default=".", help="directory to scaffold into")
+    parser.add_argument("-f", "--force", action="store_true", help="overwrite existing files")
+    parser.add_argument("--scaffold", action="store_true",
+                        help="also scaffold every problem in the list")
+    args = parser.parse_args(argv)
+
+    cookies = load_session()
+    favorites = fetch_lists(cookies)
+    if not favorites:
+        print("no lists")
+        return
+
+    selected = [pick_list(favorites, args.name)] if args.name else favorites
+    for favorite in selected:
+        print("%s  (%d problem%s, slug %s%s)"
+              % (favorite["name"], favorite["questionNumber"],
+                 "" if favorite["questionNumber"] == 1 else "s", favorite["slug"],
+                 ", public" if favorite["isPublicFavorite"] else ""))
+        questions = fetch_list_questions(cookies, favorite["slug"])
+        show_questions(questions, "  ")
+        print()
+        if args.scaffold:
+            for question in questions:
+                if not question["paidOnly"]:
+                    scaffold(question["titleSlug"], args.root, args.force)
+
+
+# -------------------------------------------------------------------------- main
+
+
+def write(path, content, force):
+    if os.path.exists(path) and not force:
+        print("  skipped (exists): %s" % path)
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle:
+        handle.write(content)
+    print("  wrote: %s" % path)
+
+
+def scaffold(target, root, force):
+    slug = resolve_slug(target)
+    payload = get(GRAPHQL, {"query": QUESTION_QUERY, "variables": {"titleSlug": slug}})
+    question = (payload.get("data") or {}).get("question")
+    if not question:
+        die("no problem with slug '%s'" % slug)
+    if not question.get("content"):
+        die("'%s' has no public content (premium problem?)" % slug)
+
+    snippets = {item["langSlug"]: item["code"] for item in question["codeSnippets"]}
+    if "cpp" not in snippets:
+        die("no C++ snippet for '%s'" % slug)
+
+    description = html_to_text(question["content"])
+    examples = parse_examples(description)
+    parsed = parse_cpp(snippets["cpp"])
+    headers = needed_headers(snippets["cpp"])
+
+    if len(parsed["methods"]) == 1:
+        impl_stem = re.search(r"([~\w]+)\s*\(", parsed["methods"][0][0]).group(1)
+    else:
+        impl_stem = parsed["class_name"]
+    impl_name = impl_stem + ".cpp"
+
+    folder = "%s-%s" % (question["questionFrontendId"], question["titleSlug"])
+    root = os.path.join(root, folder)
+    cmake_target = re.sub(r"\W", "_", question["titleSlug"])
+
+    print("%s. %s [%s] -> %s/" % (question["questionFrontendId"], question["title"],
+                                  question["difficulty"], root))
+    write(os.path.join(root, "cpp", impl_name),
+          render_impl(question, description, parsed, headers), force)
+    write(os.path.join(root, "cpp", "solution.cpp"),
+          render_driver(question, parsed, headers, examples, impl_name), force)
+    if parsed["types"]:
+        write(os.path.join(root, "cpp", TYPES_HEADER), render_types(parsed["types"]), force)
+    write(os.path.join(root, "cpp", "CMakeLists.txt"),
+          render_cmake(cmake_target, impl_name), force)
+    if "python3" in snippets:
+        write(os.path.join(root, "python", "solution.py"),
+              render_python(question, description, snippets["python3"], examples), force)
+    if not examples:
+        print("  note: no examples parsed; drivers contain a TODO")
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "lists":
+        cmd_lists(sys.argv[2:])
+        return
+    parser = argparse.ArgumentParser(
+        description="Scaffold a LeetCode problem folder, or show your lists "
+                    "(`leetcode-fetch lists --help`).")
+    parser.add_argument("problem", help="problem number, title slug, or leetcode.com URL")
+    parser.add_argument("-C", "--root", default=".", help="directory to create the folder in")
+    parser.add_argument("-f", "--force", action="store_true", help="overwrite existing files")
+    args = parser.parse_args()
+    scaffold(args.problem, args.root, args.force)
+
+
+if __name__ == "__main__":
+    main()
