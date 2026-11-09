@@ -407,7 +407,7 @@ def parse_assignments(text):
     return out
 
 
-def to_cpp_literal(value):
+def to_cpp_literal(value, type_name=""):
     out, quote = [], None
     for char in value:
         if quote:
@@ -425,6 +425,11 @@ def to_cpp_literal(value):
         else:
             out.append(char)
     literal = "".join(out)
+    if re.search(r"\bchar\b(?!\s*\*)", type_name):
+        # JSON has no char type: LeetCode writes chars as one-letter strings.
+        literal = re.sub(r'"(\\.|[^"\\])"',
+                         lambda m: "'\\''" if m.group(1) == "'" else "'%s'" % m.group(1),
+                         literal)
     return re.sub(r"\bnull\b", "nullptr", literal)
 
 
@@ -608,7 +613,7 @@ def render_driver(question, parsed, headers, examples, impl_name):
         for number, (expected, assignments) in enumerate(usable, 1):
             main.append("    {  // Example %d" % number)
             for (type_name, _), (name, value) in zip(params, assignments):
-                main.append("        %s %s = %s;" % (type_name, name, to_cpp_literal(value)))
+                main.append("        %s %s = %s;" % (type_name, name, to_cpp_literal(value, type_name)))
             main.append("        %s solution;" % parsed["class_name"])
             call = "solution.%s(%s)" % (
                 re.search(r"([~\w]+)\s*\(", method[0]).group(1),
