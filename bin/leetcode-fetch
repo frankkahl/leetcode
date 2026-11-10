@@ -518,6 +518,11 @@ def render_impl(question, description, parsed, headers):
     return "\n".join(parts) + "\n"
 
 
+def cpp_string(text):
+    """Escape text so it can sit inside a C++ double-quoted string literal."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def render_driver(question, parsed, headers, examples, impl_name):
     method = parsed["methods"][0] if len(parsed["methods"]) == 1 else None
     params = parse_params(method[0]) if method else None
@@ -526,6 +531,16 @@ def render_driver(question, parsed, headers, examples, impl_name):
         paren = method[0].index("(")
         head = method[0][:paren]
         ret = head[:re.search(r"([~\w]+)\s*$", head).start(1)].strip()
+
+    returns_value = ret not in ("", "void")
+    # Parameters taken by non-const reference: a void method reports its result by
+    # mutating these in place, so the driver prints them after the call instead.
+    ref_params = []
+    if method and params:
+        inside = method[0][method[0].index("(") + 1:method[0].rindex(")")]
+        for chunk, (_, param_name) in zip(split_top_level(inside), params):
+            if "&" in chunk and not re.search(r"\bconst\b", chunk):
+                ref_params.append(param_name)
 
     usable = []
     if method and params is not None and "*" not in "".join(t for t, _ in params):
@@ -555,7 +570,10 @@ def render_driver(question, parsed, headers, examples, impl_name):
     parts += ['#include "%s"  // class %s, exactly as pasted into LeetCode'
               % (impl_name, parsed["class_name"]), ""]
 
-    printer = True
+    design = design_cases(question, meta_data(question))
+    # print() is only needed when something is actually printed: a returned value, a
+    # design script's call results, or the in-place result of a void method.
+    printer = bool(design) or returns_value or bool(ref_params)
     if printer:
         parts += [
             "namespace {",
@@ -585,7 +603,6 @@ def render_driver(question, parsed, headers, examples, impl_name):
     main.append("    " + "".join(setup) + ";")
     main.append("")
 
-    design = design_cases(question, meta_data(question))
     if design:
         returns = {m["name"]: m["return"]["type"] for m in meta_data(question)["methods"]}
         expectations = expected_outputs(examples, len(design))
@@ -606,7 +623,7 @@ def render_driver(question, parsed, headers, examples, impl_name):
                     main.append("        print(%s);" % call)
             main.append("        cout << \"]\\n\";")
             if expected is not None:
-                main.append("        cout << \"    expected: %s\\n\";" % expected)
+                main.append("        cout << \"    expected: %s\\n\";" % cpp_string(expected))
             main.append("    }")
             main.append("")
     elif usable:
@@ -619,14 +636,22 @@ def render_driver(question, parsed, headers, examples, impl_name):
                 re.search(r"([~\w]+)\s*\(", method[0]).group(1),
                 ", ".join(name for _, name in params),
             )
-            if printer:
+            if returns_value:
                 main.append("        print(%s);" % call)
-                if expected is not None:
-                    main.append("        cout << \"    expected: %s\\n\";" % expected)
-                else:
-                    main.append("        cout << '\\n';")
             else:
+                # void: the answer is whatever the call left in its reference params.
                 main.append("        %s;" % call)
+                for index, param_name in enumerate(ref_params):
+                    if index:
+                        main.append("        cout << ' ';")
+                    main.append("        print(%s);" % param_name)
+            if not returns_value and not ref_params:
+                main.append("        // Nothing to print: the call returns void and "
+                            "mutates no argument.")
+            elif expected is not None:
+                main.append("        cout << \"    expected: %s\\n\";" % cpp_string(expected))
+            else:
+                main.append("        cout << '\\n';")
             main.append("    }")
             main.append("")
     else:
